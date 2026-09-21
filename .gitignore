@@ -1,0 +1,29 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment / secrets
+.env
+
+# Project-specific / test data
+cloned_repos/
+target_repo/
+target_repo_GO/
+target_repo_JAVA/
+target_repo_TS/
+test_repo/
+*.log
+
+# Docker / Milvus volumes
+volumes/
+etcd/
+minio/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
