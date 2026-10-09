@@ -1,9 +1,14 @@
-import requests
+from dotenv import load_dotenv
+load_dotenv()
+import os
+
+from groq import Groq
 
 from search_chunks import search_chunks
 
-OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
-GENERATE_MODEL = "llama3.2:3b"
+GENERATE_MODEL = "openai/gpt-oss-120b"  # Groq-hosted model, replaces local llama3.2:3b
+
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
 def build_prompt(question, matches):
@@ -34,12 +39,12 @@ def ask_question(question):
     matches = search_chunks(question)
     prompt = build_prompt(question, matches)
 
-    response = requests.post(
-        OLLAMA_GENERATE_URL,
-        json={"model": GENERATE_MODEL, "prompt": prompt, "stream": False},
+    response = client.chat.completions.create(
+        model=GENERATE_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
     )
-    response.raise_for_status()
-    answer = response.json()["response"]
+    answer = response.choices[0].message.content
 
     # Collect the unique file paths used, for a citation list
     cited_files = sorted(set(m["entity"]["file_path"] for m in matches))

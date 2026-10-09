@@ -1,20 +1,29 @@
+import os
+
 import requests
 
 from chunk_repo import clone_repo, walk_and_chunk
 
-OLLAMA_URL = "http://localhost:11434/api/embeddings"
-EMBED_MODEL = "nomic-embed-text"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 
 def get_embedding(text):
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": EMBED_MODEL, "prompt": text}
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    payload = {
+        "content": {
+            "parts": [{"text": text}]
+        },
+        "outputDimensionality": 768,  # keep output matching your Zilliz schema
+    }
+    response = requests.post(GEMINI_URL, headers=headers, json=payload)
     if response.status_code != 200:
-        print(f"Ollama embedding error (status {response.status_code}): {response.text}")
+        print(f"Gemini embedding error (status {response.status_code}): {response.text}")
     response.raise_for_status()
-    return response.json()["embedding"]
+    return response.json()["embedding"]["values"]
 
 
 def embed_all_chunks(repo_url, clone_dir):
@@ -52,14 +61,12 @@ if __name__ == "__main__":
 
     print(f"\n=== Embedded {len(records)} chunk(s) total ===\n")
 
-    # Sanity check: confirm every embedding is the expected length (768)
     bad_records = [r for r in records if len(r["embedding"]) != 768]
     if bad_records:
         print(f"WARNING: {len(bad_records)} chunk(s) had an unexpected embedding length!")
     else:
         print("All embeddings are 768-dimensional, as expected.")
 
-    # Show one sample record so we can eyeball the structure
     if records:
         sample = records[0]
         print("\n=== Sample record ===")

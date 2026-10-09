@@ -1,3 +1,7 @@
+from dotenv import load_dotenv
+load_dotenv()
+import os
+
 import re
 import streamlit as st
 import requests
@@ -9,7 +13,8 @@ from chunk_repo import clone_repo, walk_and_chunk
 from embed_repo import get_embedding
 from query_assistant import ask_question
 
-MILVUS_URI = "http://localhost:19530"
+MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
+MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "")
 COLLECTION_NAME = "code_chunks"
 EMBEDDING_DIM = 768
 
@@ -272,7 +277,7 @@ def get_clone_dir(repo_url):
 
 
 def setup_collection():
-    client = MilvusClient(uri=MILVUS_URI)
+    client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
     if client.has_collection(COLLECTION_NAME):
         client.drop_collection(COLLECTION_NAME)
 
