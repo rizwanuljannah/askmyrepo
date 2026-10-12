@@ -347,8 +347,14 @@ def process_repo(repo_url, status_container):
         for filepath, chunks in file_chunks.items()
         for i, chunk_text in enumerate(chunks)
     ]
-
-    MAX_WORKERS = 8  # concurrent embedding requests; lower this if the API rate-limits you
+    MAX_CHUNKS = 250  # keeps demo indexing inside the free API limits
+    if len(work_items) > MAX_CHUNKS:
+        status_container.warning(
+            f"Large repo: indexing only the first {MAX_CHUNKS} of {len(work_items)} chunks (free API limits)."
+        )
+        work_items = work_items[:MAX_CHUNKS]
+    total_chunks = len(work_items)
+    MAX_WORKERS = 4  # concurrent embedding requests; lower this if the API rate-limits you
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_item = {
