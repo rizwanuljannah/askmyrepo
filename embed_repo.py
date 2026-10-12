@@ -1,6 +1,7 @@
 import os
-import time
 import threading
+import time
+
 import requests
 
 from chunk_repo import clone_repo, walk_and_chunk
@@ -8,9 +9,8 @@ from chunk_repo import clone_repo, walk_and_chunk
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-
-def get_embedding(text):
-   _throttle_lock = threading.Lock()
+# Throttle shared by all threads so we stay under the free-tier request limit
+_throttle_lock = threading.Lock()
 _last_call = [0.0]
 MIN_INTERVAL = 0.7  # ~85 requests/minute, under the 100/min free limit
 
@@ -30,7 +30,7 @@ def get_embedding(text, max_retries=4):
     }
     payload = {
         "content": {"parts": [{"text": text}]},
-        "outputDimensionality": 768,
+        "outputDimensionality": 768,  # keep output matching the Zilliz schema
     }
     for attempt in range(max_retries + 1):
         _wait_turn()
@@ -43,6 +43,7 @@ def get_embedding(text, max_retries=4):
         print(f"Gemini embedding error (status {response.status_code}): {response.text}")
     response.raise_for_status()
     return response.json()["embedding"]["values"]
+
 
 def embed_all_chunks(repo_url, clone_dir):
     """Clone the repo, chunk every file, and embed every chunk.
