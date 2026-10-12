@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
-import os
 
+import os
 import re
 import streamlit as st
 import requests
@@ -295,8 +295,13 @@ def setup_collection():
     return client
 
 
+# Remembers the most recent embedding failure so the UI can show *why*
+# chunks were skipped (useful when debugging a deployment).
+LAST_EMBED_ERROR = {}
+
+
 def safe_get_embedding(chunk_text, max_retries=1):
-    """Try to embed a chunk. If Ollama rejects it for being too long,
+    """Try to embed a chunk. If the API rejects it for being too long,
     truncate it and try once more. Returns None if it still fails,
     so the caller can skip this chunk instead of crashing."""
     text_to_send = chunk_text
@@ -305,11 +310,14 @@ def safe_get_embedding(chunk_text, max_retries=1):
             return get_embedding(text_to_send)
         except requests.exceptions.HTTPError as e:
             body = e.response.text if e.response is not None else ""
+            status = e.response.status_code if e.response is not None else "?"
+            LAST_EMBED_ERROR["msg"] = f"HTTP {status}: {body[:300]}"
             if "context length" in body.lower() and attempt < max_retries:
                 text_to_send = text_to_send[: len(text_to_send) // 2]
                 continue
             return None
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            LAST_EMBED_ERROR["msg"] = f"{type(e).__name__}: {e}"
             return None
     return None
 
@@ -332,7 +340,7 @@ def process_repo(repo_url, status_container):
     done = 0
 
     # Flatten to a single list of (filepath, chunk_index, chunk_text) so we
-    # can fire many embedding requests at Ollama concurrently instead of
+    # can fire many embedding requests concurrently instead of
     # waiting for each one to finish before starting the next.
     work_items = [
         (filepath, i, chunk_text)
@@ -340,7 +348,7 @@ def process_repo(repo_url, status_container):
         for i, chunk_text in enumerate(chunks)
     ]
 
-    MAX_WORKERS = 8  # concurrent requests to Ollama; lower this if it overwhelms your machine
+    MAX_WORKERS = 8  # concurrent embedding requests; lower this if the API rate-limits you
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_item = {
@@ -366,6 +374,7 @@ def process_repo(repo_url, status_container):
 
     if skipped:
         status_container.warning(f"Skipped {len(skipped)} chunk(s) that couldn't be embedded.")
+        status_container.code(LAST_EMBED_ERROR.get("msg", "unknown error"))
 
     if not records:
         status_container.error("No chunks were successfully embedded. Nothing to index.")
