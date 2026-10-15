@@ -283,14 +283,57 @@ def ensure_collection(client):
     client.create_collection(collection_name=COLLECTION_NAME, schema=schema, index_params=index_params)
 
 
-def repo_is_indexed(client, repo):
+# --- Indexing order and batch size ------------------------------------
+BATCH_SIZE = 250  # chunks embedded per click (keeps within free API limits)
+MAX_WORKERS = 4   # embed_repo.py throttles the real request rate
+
+SOURCE_EXTS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".h", ".hpp",
+    ".go", ".rs", ".cs", ".rb", ".php", ".kt", ".swift",
+}
+LOW_PRIORITY_DIRS = {
+    "test", "tests", "__tests__", "spec", "docs", "doc", "examples", "example",
+    "benchmarks", "fixtures", "samples", "demo", "demos",
+}
+TEST_SUFFIXES = (
+    "_test.py", "_test.go", ".test.js", ".test.ts", ".spec.js", ".spec.ts",
+    "test.java", "tests.java",
+)
+
+
+def file_priority(filepath, clone_dir):
+    """0 = main source code, 1 = tests/examples, 2 = docs/config/data."""
+    rel = filepath.replace("\\", "/")
+    prefix = clone_dir.replace("\\", "/") + "/"
+    if rel.startswith(prefix):
+        rel = rel[len(prefix):]
+    parts = rel.lower().split("/")
+    name = parts[-1]
+    ext = os.path.splitext(name)[1]
+    in_low_dir = any(p in LOW_PRIORITY_DIRS for p in parts[:-1])
+    is_test_file = name.startswith("test_") or name.endswith(TEST_SUFFIXES)
+    if ext not in SOURCE_EXTS:
+        return 2
+    if in_low_dir or is_test_file:
+        return 1
+    return 0
+
+
+def repo_status(client, repo):
+    """How much of this repo is indexed? Returns None if nothing is, else
+    {"indexed": rows stored, "next_offset": where the next batch starts, "total": chunks in repo}."""
     rows = client.query(
         collection_name=COLLECTION_NAME,
         filter=f'repo == "{repo}"',
-        output_fields=["chunk_index"],
-        limit=1,
+        output_fields=["chunk_order", "repo_total"],
+        limit=16384,
     )
-    return len(rows) > 0
+    if not rows:
+        return None
+    orders = [r["chunk_order"] for r in rows if "chunk_order" in r]
+    total = next((r["repo_total"] for r in rows if "repo_total" in r), len(rows))
+    next_offset = (max(orders) + 1) if orders else len(rows)
+    return {"indexed": len(rows), "next_offset": next_offset, "total": total}
 
 
 # Remembers the most recent embedding failure so the UI can show *why*
@@ -320,13 +363,20 @@ def safe_get_embedding(chunk_text, max_retries=1):
     return None
 
 
-def process_repo(repo, status_container, force=False):
+def process_repo(repo, status_container, force=False, extend=False):
+    """Index a repo (first BATCH_SIZE chunks, main source code first).
+    extend=True adds the next batch to what is already indexed.
+    force=True rebuilds the repo's index from scratch."""
     client = get_client()
     ensure_collection(client)
 
-    # Already indexed (e.g. earlier session)? Open it instantly, no embedding quota used.
-    if not force and repo_is_indexed(client, repo):
-        status_container.success("Already indexed. Opening the chat. (Tick 'Re-index' to rebuild it.)")
+    status = repo_status(client, repo)
+
+    # Already indexed? Open it instantly, no embedding quota used.
+    if status and not force and not extend:
+        status_container.success(
+            f"Already indexed ({status['indexed']} of {status['total']} chunks). Opening the chat."
+        )
         return True
 
     clone_dir = get_clone_dir(repo)
@@ -336,41 +386,45 @@ def process_repo(repo, status_container, force=False):
 
     status_container.write("Chunking files...")
     file_chunks = walk_and_chunk(clone_dir)
-    total_chunks = sum(len(c) for c in file_chunks.values())
-    status_container.write(f"Found {total_chunks} chunk(s) across {len(file_chunks)} file(s).")
 
-    status_container.write("Embedding chunks (parallelized)...")
+    # Flatten, then order: main source code first, tests/examples next, docs/config last.
+    all_items = [
+        (filepath, i, chunk_text)
+        for filepath, chunks in file_chunks.items()
+        for i, chunk_text in enumerate(chunks)
+    ]
+    all_items.sort(key=lambda item: (file_priority(item[0], clone_dir), item[0], item[1]))
+    total = len(all_items)
+    status_container.write(f"Found {total} chunk(s) across {len(file_chunks)} file(s).")
+
+    start = status["next_offset"] if (extend and status) else 0
+    if start >= total:
+        status_container.success("Every chunk of this repo is already indexed.")
+        return True
+
+    batch = [
+        (order, filepath, i, chunk_text)
+        for order, (filepath, i, chunk_text) in enumerate(all_items[start:start + BATCH_SIZE], start=start)
+    ]
+    if start + len(batch) < total:
+        status_container.info(
+            f"Indexing chunks {start + 1} to {start + len(batch)} of {total} (free API limits)."
+        )
+
+    status_container.write("Embedding chunks...")
     progress_bar = status_container.progress(0.0)
     records = []
     skipped = []
     done = 0
 
-    # Flatten to a single list of (filepath, chunk_index, chunk_text) so we
-    # can fire several embedding requests concurrently.
-    work_items = [
-        (filepath, i, chunk_text)
-        for filepath, chunks in file_chunks.items()
-        for i, chunk_text in enumerate(chunks)
-    ]
-
-    MAX_CHUNKS = 250  # keeps demo indexing inside the free API limits
-    if len(work_items) > MAX_CHUNKS:
-        status_container.warning(
-            f"Large repo: indexing only the first {MAX_CHUNKS} of {len(work_items)} chunks (free API limits)."
-        )
-        work_items = work_items[:MAX_CHUNKS]
-    total_chunks = len(work_items)
-
-    MAX_WORKERS = 4  # embed_repo.py throttles the real request rate
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_item = {
-            executor.submit(safe_get_embedding, chunk_text): (filepath, i, chunk_text)
-            for filepath, i, chunk_text in work_items
+            executor.submit(safe_get_embedding, chunk_text): (order, filepath, i, chunk_text)
+            for order, filepath, i, chunk_text in batch
         }
 
         for future in as_completed(future_to_item):
-            filepath, i, chunk_text = future_to_item[future]
+            order, filepath, i, chunk_text = future_to_item[future]
             embedding = future.result()
             if embedding is None:
                 skipped.append(f"{filepath} (chunk {i})")
@@ -381,10 +435,11 @@ def process_repo(repo, status_container, force=False):
                     "chunk_text": chunk_text,
                     "embedding": embedding,
                     "repo": repo,
+                    "chunk_order": order,
+                    "repo_total": total,
                 })
             done += 1
-            if total_chunks:
-                progress_bar.progress(done / total_chunks, text=f"Processed {done}/{total_chunks} chunks")
+            progress_bar.progress(done / len(batch), text=f"Processed {done}/{len(batch)} chunks")
 
     if skipped:
         status_container.warning(f"Skipped {len(skipped)} chunk(s) that couldn't be embedded.")
@@ -395,13 +450,25 @@ def process_repo(repo, status_container, force=False):
         return False
 
     status_container.write("Saving to the vector database...")
-    # Replace any older copy of this repo, leave other repos untouched
-    client.delete(collection_name=COLLECTION_NAME, filter=f'repo == "{repo}"')
+    if not extend:
+        # Fresh index or forced rebuild: replace this repo's old rows, leave other repos alone
+        client.delete(collection_name=COLLECTION_NAME, filter=f'repo == "{repo}"')
     client.insert(collection_name=COLLECTION_NAME, data=records)
     client.flush(COLLECTION_NAME)
 
-    status_container.success(f"Indexed {len(records)} chunk(s). Ready to answer questions.")
+    indexed = (status["indexed"] if (extend and status) else 0) + len(records)
+    status_container.success(
+        f"Indexed {len(records)} new chunk(s): {indexed} of {total} total. Ready to answer questions."
+    )
     return True
+
+
+def open_chat(repo):
+    """Make sure a chat exists for this repo, refresh its coverage, and open it."""
+    if repo not in st.session_state.chats:
+        st.session_state.chats[repo] = {"messages": []}
+    st.session_state.chats[repo]["coverage"] = repo_status(get_client(), repo)
+    st.session_state.active_repo = repo
 
 
 # ----------------------------------------------------------------------
@@ -430,9 +497,7 @@ with st.sidebar:
                 with st.spinner("Working..."):
                     success = process_repo(repo, status_box, force_reindex)
             if success:
-                if repo not in st.session_state.chats:
-                    st.session_state.chats[repo] = {"messages": []}
-                st.session_state.active_repo = repo
+                open_chat(repo)
 
     st.divider()
 
@@ -455,6 +520,23 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
         st.caption(active)
+
+        coverage = st.session_state.chats[active].get("coverage")
+        extend_clicked = False
+        if coverage and coverage["indexed"] < coverage["total"]:
+            extend_clicked = st.button(
+                f"Index next {BATCH_SIZE} chunks", use_container_width=True
+            )
+        if extend_clicked:
+            with status_box:
+                with st.spinner("Working..."):
+                    extended_ok = process_repo(active, status_box, extend=True)
+            if extended_ok:
+                open_chat(active)
+                coverage = st.session_state.chats[active].get("coverage")
+        if coverage:
+            st.caption(f"Indexed {coverage['indexed']} of {coverage['total']} chunks")
+
         if st.session_state.chats[active]["messages"]:
             if st.button("Clear this chat", use_container_width=True):
                 st.session_state.chats[active]["messages"] = []
@@ -482,6 +564,14 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# Be upfront when only part of a big repo is searchable
+active_coverage = st.session_state.chats[active].get("coverage") if active else None
+if active_coverage and active_coverage["indexed"] < active_coverage["total"]:
+    st.caption(
+        f"⚠️ Answers cover {active_coverage['indexed']} of {active_coverage['total']} chunks "
+        f"(main source files are indexed first). Use the sidebar button to index more."
+    )
 
 if not active:
     st.markdown(
