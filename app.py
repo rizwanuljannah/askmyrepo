@@ -15,7 +15,7 @@ from query_assistant import ask_question
 
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
 MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "")
-COLLECTION_NAME = "code_chunks"
+COLLECTION_NAME = "code_chunks_v2"
 EMBEDDING_DIM = 768
 
 # Only plain GitHub repo URLs are accepted (also keeps the Milvus filter string safe)
@@ -266,14 +266,9 @@ def get_client():
 
 
 def ensure_collection(client):
-    """Create the collection if missing. If an older collection without
-    dynamic-field support exists, recreate it once."""
+    """Create the collection if it doesn't exist yet (never drops anything)."""
     if client.has_collection(COLLECTION_NAME):
-        info = client.describe_collection(COLLECTION_NAME)
-        # Only an explicit False means "old schema"; a missing key never drops data.
-        if info.get("enable_dynamic_field", True):
-            return
-        client.drop_collection(COLLECTION_NAME)
+        return
 
     schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
     schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)

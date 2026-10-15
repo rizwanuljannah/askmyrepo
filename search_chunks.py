@@ -10,7 +10,7 @@ from embed_repo import get_embedding
 # Falls back to local Docker Milvus if env vars aren't set; use Zilliz values when deployed
 MILVUS_URI = os.environ.get("MILVUS_URI", "http://localhost:19530")
 MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "")  # Zilliz needs a token; local Milvus doesn't
-COLLECTION_NAME = "code_chunks"
+COLLECTION_NAME = "code_chunks_v2"
 TOP_K = 3  # how many matching chunks to retrieve
 
 client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
