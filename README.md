@@ -4,8 +4,6 @@ Ask questions about any public GitHub repository in plain English and get answer
 
 **Live demo:** https://askmyrepo.streamlit.app
 
-<!-- Add a screenshot or GIF here, for example: ![AskMyRepo screenshot](docs/screenshot.png) -->
-
 ## What it does
 
 Paste a GitHub repo URL, let the app index it, then ask things like *"How does this app connect to a database?"* or *"Where is authentication handled?"*. Each answer is generated from the code and docs that were actually retrieved, and the files used are listed under the answer. If the retrieved code doesn't contain the answer, the assistant says so instead of guessing.
@@ -17,6 +15,16 @@ Paste a GitHub repo URL, let the app index it, then ask things like *"How does t
 - Batch indexing for large repos, with an **Index next 250 chunks** button and a coverage display ("Indexed 250 of 1,635 chunks").
 - Re-opening a repo that is already indexed is instant and uses no embedding quota.
 - Several repos can be indexed side by side. Each chat only searches its own repo.
+
+## Screenshots
+
+**A cited answer.** The assistant explains how a repo's Docker build and GitHub Action work, and lists the files it used under the answer. The sidebar keeps one chat per repo under Previous chats.
+
+![A cited answer with source files, and the Previous chats list](docs/chat-answer.png)
+
+**Indexing a repo.** Paste a GitHub URL and the app clones it, chunks the files, embeds the chunks and saves them to the vector database, then opens an empty chat for that repo.
+
+![Processing a repository from the sidebar](docs/indexing.png)
 
 ## How it works
 
