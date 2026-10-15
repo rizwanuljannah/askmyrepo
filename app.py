@@ -18,6 +18,9 @@ MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "")
 COLLECTION_NAME = "code_chunks"
 EMBEDDING_DIM = 768
 
+# Only plain GitHub repo URLs are accepted (also keeps the Milvus filter string safe)
+REPO_URL_PATTERN = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+$")
+
 st.set_page_config(
     page_title="Codebase Dev Assistant",
     page_icon="🧠",
@@ -26,43 +29,29 @@ st.set_page_config(
 )
 
 # ----------------------------------------------------------------------
-# Session state defaults
+# Session state
+#   chats: {repo_url: {"messages": [ {"role", "content", "sources"?} ]}}
+#   active_repo: the repo whose chat is currently open
 # ----------------------------------------------------------------------
-if "repo_processed" not in st.session_state:
-    st.session_state.repo_processed = False
-if "theme" not in st.session_state:
-    st.session_state.theme = "light"
-if "messages" not in st.session_state:
-    # each item: {"role": "user"/"assistant", "content": str, "sources": list[str] (optional)}
-    st.session_state.messages = []
-if "current_repo" not in st.session_state:
-    st.session_state.current_repo = None
+if "chats" not in st.session_state:
+    st.session_state.chats = {}
+if "active_repo" not in st.session_state:
+    st.session_state.active_repo = None
 
 
 # ----------------------------------------------------------------------
-# Theme / CSS
+# Dark theme CSS (this app is dark-only)
 # ----------------------------------------------------------------------
-def inject_css(theme: str):
-    if theme == "dark":
-        bg = "#0f1115"
-        bg_secondary = "#171a21"
-        bg_chat_user = "#2b2f3a"
-        bg_chat_assistant = "#1b1e26"
-        text_primary = "#e8e9ec"
-        text_secondary = "#9aa0ac"
-        border = "#2a2e37"
-        accent = "#6c8cff"
-        input_bg = "#171a21"
-    else:
-        bg = "#ffffff"
-        bg_secondary = "#f7f7f8"
-        bg_chat_user = "#eef1ff"
-        bg_chat_assistant = "#f7f7f8"
-        text_primary = "#1a1a1a"
-        text_secondary = "#6b7280"
-        border = "#e5e7eb"
-        accent = "#4f6bed"
-        input_bg = "#ffffff"
+def inject_css():
+    bg = "#0f1115"
+    bg_secondary = "#171a21"
+    bg_chat_user = "#2b2f3a"
+    bg_chat_assistant = "#1b1e26"
+    text_primary = "#e8e9ec"
+    text_secondary = "#9aa0ac"
+    border = "#2a2e37"
+    accent = "#6c8cff"
+    input_bg = "#171a21"
 
     st.markdown(
         f"""
@@ -127,8 +116,8 @@ def inject_css(theme: str):
 
             .app-header {{
                 display: flex;
-                align-items: center;
-                gap: 0.6rem;
+                align-items: baseline;
+                gap: 0.8rem;
                 padding: 0.25rem 0 1rem 0;
                 border-bottom: 1px solid {border};
                 margin-bottom: 1.25rem;
@@ -144,30 +133,6 @@ def inject_css(theme: str):
                 font-size: 0.85rem;
             }}
 
-            .chat-bubble {{
-                padding: 0.85rem 1.1rem;
-                border-radius: 14px;
-                margin-bottom: 0.9rem;
-                line-height: 1.55;
-                font-size: 0.95rem;
-                max-width: 100%;
-            }}
-            .chat-bubble.user {{
-                background-color: {bg_chat_user};
-                border: 1px solid {border};
-            }}
-            .chat-bubble.assistant {{
-                background-color: {bg_chat_assistant};
-                border: 1px solid {border};
-            }}
-            .chat-role {{
-                font-size: 0.75rem;
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.03em;
-                color: {text_secondary};
-                margin-bottom: 0.35rem;
-            }}
             .stApp .sources-box, .stApp .sources-box b {{
                 margin-top: 0.6rem;
                 padding-top: 0.5rem;
@@ -264,24 +229,53 @@ def inject_css(theme: str):
     )
 
 
-inject_css(st.session_state.theme)
+inject_css()
 
 
 # ----------------------------------------------------------------------
-# Backend helpers (unchanged logic from the original app)
+# Repo helpers
 # ----------------------------------------------------------------------
+def normalize_repo_url(url):
+    """Return a cleaned, lowercase GitHub repo URL, or None if it isn't valid."""
+    url = (url or "").strip().rstrip("/")
+    url = re.sub(r"\.git$", "", url)
+    if not REPO_URL_PATTERN.match(url):
+        return None
+    return url.lower()
+
+
+def repo_label(repo_url):
+    """'https://github.com/owner/name' -> 'owner/name'"""
+    return "/".join(repo_url.split("/")[-2:])
+
+
 def get_clone_dir(repo_url):
-    name = repo_url.rstrip("/").split("/")[-1]
-    name = re.sub(r"\.git$", "", name)
-    return f"cloned_repos/{name}"
+    owner, name = repo_url.split("/")[-2:]
+    return f"cloned_repos/{owner}__{name}"
 
 
-def setup_collection():
-    client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+# ----------------------------------------------------------------------
+# Milvus / Zilliz helpers
+#   One shared collection holds every repo's chunks. Each chunk carries a
+#   "repo" value (stored as a dynamic field) so searches can be limited to
+#   the repo whose chat is open.
+# ----------------------------------------------------------------------
+@st.cache_resource
+def get_client():
+    return MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
+
+
+def ensure_collection(client):
+    """Create the collection if missing. If an older collection without
+    dynamic-field support exists, recreate it once."""
     if client.has_collection(COLLECTION_NAME):
+        info = client.describe_collection(COLLECTION_NAME)
+        # Only an explicit False means "old schema"; a missing key never drops data.
+        if info.get("enable_dynamic_field", True):
+            return
         client.drop_collection(COLLECTION_NAME)
 
-    schema = client.create_schema(auto_id=True, enable_dynamic_field=False)
+    schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
     schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
     schema.add_field(field_name="file_path", datatype=DataType.VARCHAR, max_length=1000)
     schema.add_field(field_name="chunk_index", datatype=DataType.INT64)
@@ -292,7 +286,16 @@ def setup_collection():
     index_params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="COSINE")
 
     client.create_collection(collection_name=COLLECTION_NAME, schema=schema, index_params=index_params)
-    return client
+
+
+def repo_is_indexed(client, repo):
+    rows = client.query(
+        collection_name=COLLECTION_NAME,
+        filter=f'repo == "{repo}"',
+        output_fields=["chunk_index"],
+        limit=1,
+    )
+    return len(rows) > 0
 
 
 # Remembers the most recent embedding failure so the UI can show *why*
@@ -322,11 +325,19 @@ def safe_get_embedding(chunk_text, max_retries=1):
     return None
 
 
-def process_repo(repo_url, status_container):
-    clone_dir = get_clone_dir(repo_url)
+def process_repo(repo, status_container, force=False):
+    client = get_client()
+    ensure_collection(client)
+
+    # Already indexed (e.g. earlier session)? Open it instantly, no embedding quota used.
+    if not force and repo_is_indexed(client, repo):
+        status_container.success("Already indexed. Opening the chat. (Tick 'Re-index' to rebuild it.)")
+        return True
+
+    clone_dir = get_clone_dir(repo)
 
     status_container.write("Cloning repo...")
-    clone_repo(repo_url, clone_dir)
+    clone_repo(repo, clone_dir)
 
     status_container.write("Chunking files...")
     file_chunks = walk_and_chunk(clone_dir)
@@ -340,13 +351,13 @@ def process_repo(repo_url, status_container):
     done = 0
 
     # Flatten to a single list of (filepath, chunk_index, chunk_text) so we
-    # can fire many embedding requests concurrently instead of
-    # waiting for each one to finish before starting the next.
+    # can fire several embedding requests concurrently.
     work_items = [
         (filepath, i, chunk_text)
         for filepath, chunks in file_chunks.items()
         for i, chunk_text in enumerate(chunks)
     ]
+
     MAX_CHUNKS = 250  # keeps demo indexing inside the free API limits
     if len(work_items) > MAX_CHUNKS:
         status_container.warning(
@@ -354,7 +365,8 @@ def process_repo(repo_url, status_container):
         )
         work_items = work_items[:MAX_CHUNKS]
     total_chunks = len(work_items)
-    MAX_WORKERS = 4  # concurrent embedding requests; lower this if the API rate-limits you
+
+    MAX_WORKERS = 4  # embed_repo.py throttles the real request rate
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_item = {
@@ -373,6 +385,7 @@ def process_repo(repo_url, status_container):
                     "chunk_index": i,
                     "chunk_text": chunk_text,
                     "embedding": embedding,
+                    "repo": repo,
                 })
             done += 1
             if total_chunks:
@@ -386,20 +399,18 @@ def process_repo(repo_url, status_container):
         status_container.error("No chunks were successfully embedded. Nothing to index.")
         return False
 
-    status_container.write("Setting up Milvus collection...")
-    client = setup_collection()
-
-    status_container.write("Inserting into Milvus...")
+    status_container.write("Saving to the vector database...")
+    # Replace any older copy of this repo, leave other repos untouched
+    client.delete(collection_name=COLLECTION_NAME, filter=f'repo == "{repo}"')
     client.insert(collection_name=COLLECTION_NAME, data=records)
     client.flush(COLLECTION_NAME)
-    stats = client.get_collection_stats(COLLECTION_NAME)
 
-    status_container.success(f"Indexed {stats['row_count']} chunk(s). Ready to answer questions.")
+    status_container.success(f"Indexed {len(records)} chunk(s). Ready to answer questions.")
     return True
 
 
 # ----------------------------------------------------------------------
-# Sidebar — repo input + theme toggle
+# Sidebar: new repo + previous chats
 # ----------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### 🧠 Codebase Dev Assistant")
@@ -407,80 +418,98 @@ with st.sidebar:
 
     st.divider()
 
-    theme_choice = st.radio(
-        "Theme",
-        options=["Light", "Dark"],
-        index=0 if st.session_state.theme == "light" else 1,
-        horizontal=True,
-    )
-    new_theme = theme_choice.lower()
-    if new_theme != st.session_state.theme:
-        st.session_state.theme = new_theme
-        st.rerun()
-
-    st.divider()
-
-    st.markdown("#### Repository")
-    repo_url = st.text_input("GitHub repo URL", placeholder="https://github.com/user/repo")
+    st.markdown("#### New repository")
+    repo_input = st.text_input("GitHub repo URL", placeholder="https://github.com/user/repo")
+    force_reindex = st.checkbox("Re-index even if already indexed", value=False)
     process_clicked = st.button("Process Repo", use_container_width=True, type="primary")
 
     status_box = st.container()
 
-    if process_clicked and repo_url:
-        st.session_state.messages = []
-        with status_box:
-            with st.spinner("Working..."):
-                success = process_repo(repo_url, status_box)
-        if success:
-            st.session_state.repo_processed = True
-            st.session_state.current_repo = repo_url
+    if process_clicked:
+        repo = normalize_repo_url(repo_input)
+        if not repo:
+            with status_box:
+                st.error("Enter a valid GitHub URL, like https://github.com/user/repo")
+        else:
+            with status_box:
+                with st.spinner("Working..."):
+                    success = process_repo(repo, status_box, force_reindex)
+            if success:
+                if repo not in st.session_state.chats:
+                    st.session_state.chats[repo] = {"messages": []}
+                st.session_state.active_repo = repo
 
     st.divider()
 
-    if st.session_state.repo_processed:
-        st.markdown(
-            f'<span class="status-pill ready">● Repo indexed</span>',
-            unsafe_allow_html=True,
-        )
-        if st.session_state.current_repo:
-            st.caption(st.session_state.current_repo)
-    else:
-        st.markdown(
-            '<span class="status-pill notready">● No repo indexed yet</span>',
-            unsafe_allow_html=True,
-        )
-
-    if st.session_state.messages:
-        st.divider()
-        if st.button("Clear chat", use_container_width=True):
-            st.session_state.messages = []
+    st.markdown("#### Previous chats")
+    if not st.session_state.chats:
+        st.caption("No chats yet. Process a repo to start one.")
+    for repo_key in reversed(list(st.session_state.chats.keys())):
+        is_active = repo_key == st.session_state.active_repo
+        label = ("● " if is_active else "💬 ") + repo_label(repo_key)
+        if st.button(label, key=f"chat_{repo_key}", use_container_width=True):
+            st.session_state.active_repo = repo_key
             st.rerun()
 
+    st.divider()
+
+    active = st.session_state.active_repo
+    if active:
+        st.markdown(
+            '<span class="status-pill ready">● Repo indexed</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(active)
+        if st.session_state.chats[active]["messages"]:
+            if st.button("Clear this chat", use_container_width=True):
+                st.session_state.chats[active]["messages"] = []
+                st.rerun()
+    else:
+        st.markdown(
+            '<span class="status-pill notready">● No repo selected</span>',
+            unsafe_allow_html=True,
+        )
+
 
 # ----------------------------------------------------------------------
-# Main area — ChatGPT-style chat
+# Main area: the open chat
 # ----------------------------------------------------------------------
+active = st.session_state.active_repo
+messages = st.session_state.chats[active]["messages"] if active else []
+
+subtitle = f'<span class="subtitle">{repo_label(active)}</span>' if active else ""
 st.markdown(
-    """
+    f"""
     <div class="app-header">
         <h1>Ask your codebase</h1>
+        {subtitle}
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-if not st.session_state.messages:
+if not active:
+    st.markdown(
+        """
+        <div class="empty-state">
+            <h3>No chat open</h3>
+            <p>Process a repo from the sidebar, or open one from Previous chats.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+elif not messages:
     st.markdown(
         """
         <div class="empty-state">
             <h3>No questions yet</h3>
-            <p>Process a repo from the sidebar, then ask anything about it below.</p>
+            <p>Ask anything about this repo below.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 else:
-    for msg in st.session_state.messages:
+    for msg in messages:
         avatar = "🧑" if msg["role"] == "user" else "🤖"
         with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
@@ -494,26 +523,21 @@ else:
 question = st.chat_input("Ask something about the codebase...")
 
 if question:
-    st.session_state.messages.append({"role": "user", "content": question})
-
-    if not st.session_state.repo_processed:
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": "Please process a repository first (see the sidebar).",
-        })
+    if not active:
+        st.warning("Process a repo or open a previous chat from the sidebar first.")
     else:
+        messages.append({"role": "user", "content": question})
         try:
             with st.spinner("Thinking..."):
-                answer, cited_files = ask_question(question)
-            st.session_state.messages.append({
+                answer, cited_files = ask_question(question, repo=active)
+            messages.append({
                 "role": "assistant",
                 "content": answer,
                 "sources": cited_files,
             })
         except Exception as e:
-            st.session_state.messages.append({
+            messages.append({
                 "role": "assistant",
                 "content": f"Something went wrong answering the question: {e}",
             })
-
-    st.rerun()
+        st.rerun()

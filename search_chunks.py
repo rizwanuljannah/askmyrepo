@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 
 from pymilvus import MilvusClient
@@ -15,15 +16,21 @@ TOP_K = 3  # how many matching chunks to retrieve
 client = MilvusClient(uri=MILVUS_URI, token=MILVUS_TOKEN)
 
 
-def search_chunks(question, top_k=TOP_K):
-    """Embed the question, search Milvus, and return the top matching chunks."""
+def search_chunks(question, top_k=TOP_K, repo=None):
+    """Embed the question, search Milvus, and return the top matching chunks.
+    If repo is given, only chunks from that repo are searched."""
     question_embedding = get_embedding(question)
+
+    search_kwargs = {}
+    if repo:
+        search_kwargs["filter"] = f'repo == "{repo}"'
 
     results = client.search(
         collection_name=COLLECTION_NAME,
         data=[question_embedding],
         limit=top_k,
         output_fields=["file_path", "chunk_index", "chunk_text"],
+        **search_kwargs,
     )
 
     # results[0] is the list of matches for our one question

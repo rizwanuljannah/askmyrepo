@@ -18,7 +18,7 @@ if client.has_collection(COLLECTION_NAME):
     print(f"Dropped existing collection '{COLLECTION_NAME}'.")
 
 # Define the schema: auto id, file_path, chunk_index, chunk_text, and the embedding vector
-schema = client.create_schema(auto_id=True, enable_dynamic_field=False)
+schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
 
 schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
 schema.add_field(field_name="file_path", datatype=DataType.VARCHAR, max_length=1024)

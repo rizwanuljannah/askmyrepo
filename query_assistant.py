@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 
 from groq import Groq
@@ -12,7 +13,7 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
 def build_prompt(question, matches):
-    """Combine the question and retrieved chunks into one prompt for llama3."""
+    """Combine the question and retrieved chunks into one prompt for the LLM."""
     context_parts = []
     for match in matches:
         file_path = match["entity"]["file_path"]
@@ -35,8 +36,9 @@ Answer:"""
     return prompt
 
 
-def ask_question(question):
-    matches = search_chunks(question)
+def ask_question(question, repo=None):
+    """Answer a question. If repo is given, only that repo's chunks are searched."""
+    matches = search_chunks(question, repo=repo)
     prompt = build_prompt(question, matches)
 
     response = client.chat.completions.create(
